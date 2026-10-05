@@ -1,6 +1,7 @@
 name: lock-audit
 
-# One-shot verification (build image, run lock-rule tests, HTTP smoke):
+# One-shot verification (build image, run lock-rule tests, HTTP smoke and the
+# overlapping-submission / crash-recovery boundary):
 #   docker compose up --build --exit-code-from verify verify
 # (or simply ./verify.sh, which also tears the stack down afterwards)
 #

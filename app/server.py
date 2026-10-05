@@ -15,11 +15,19 @@ import json
 import logging
 import os
 import re
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import canonical, consensus, schema, store as store_mod
 
 MAX_BODY_BYTES = 1 << 20  # 1 MiB
+# How long an overlapping equivalent submission waits for the in-flight
+# evaluation to publish a verdict before adopting the reservation itself.
+AUDIT_WAIT_TIMEOUT = float(os.environ.get("AUDIT_WAIT_TIMEOUT", "30"))
+# Optional delay (seconds, float) before the audit engine runs.  Intended for
+# tests/verification to reliably create overlapping submissions; off by
+# default and never affects audit semantics.
+AUDIT_EVAL_DELAY = float(os.environ.get("AUDIT_EVAL_DELAY", "0") or 0)
 _AUDIT_PATH_RE = re.compile(r"^/v1/audits/([A-Za-z0-9][A-Za-z0-9._:\-]{0,127})$")
 
 LOG = logging.getLogger("lock-audit")
@@ -109,29 +117,53 @@ class Handler(BaseHTTPRequestHandler):
 
         audit_id = submission["audit_id"]
         digest = canonical.submission_digest(submission)
-        outcome = self.audit_store.reserve(audit_id, digest)
-        if outcome == store_mod.CONFLICT:
-            self._send_error(
-                409, "conflict",
-                f"audit_id {audit_id!r} already has a verdict for different "
-                "content")
-            return
-        if outcome == store_mod.PENDING:
-            self._send_error(
-                409, "in_progress",
-                f"audit_id {audit_id!r} is already being evaluated")
-            return
-        if outcome == store_mod.REPLAY:
-            verdict = self.audit_store.get(audit_id)
-            verdict["replayed"] = True
-            self._send_json(200, verdict)
-            return
 
-        verdict = consensus.Engine(submission).run()
-        self.audit_store.put(audit_id, digest, verdict)
-        verdict = dict(verdict)
-        verdict["replayed"] = False
-        self._send_json(201, verdict)
+        # Overlapping identical submissions are a single audit: the first
+        # caller evaluates it while equivalent callers wait for the verdict
+        # and then replay it.  Content that differs conflicts immediately.
+        while True:
+            outcome = self.audit_store.begin(audit_id, digest)
+            if outcome == store_mod.CONFLICT:
+                self._send_error(
+                    409, "conflict",
+                    f"audit_id {audit_id!r} already has a verdict for different "
+                    "content")
+                return
+            if outcome == store_mod.REPLAY:
+                verdict = self.audit_store.get(audit_id)
+                verdict["replayed"] = True
+                self._send_json(200, verdict)
+                return
+            if outcome == store_mod.PENDING:
+                verdict = self.audit_store.await_verdict(
+                    audit_id, timeout=AUDIT_WAIT_TIMEOUT)
+                if verdict is not None:
+                    verdict["replayed"] = True
+                    self._send_json(200, verdict)
+                    return
+                # The in-flight owner vanished without publishing; loop back
+                # and adopt the pending reservation ourselves.
+                continue
+
+            # outcome == NEW: this call owns the single evaluation.
+            try:
+                # Test/verification seam (default off): pause after reserving
+                # the audit so overlapping submissions reliably arrive while
+                # the evaluation is in flight.
+                if AUDIT_EVAL_DELAY:
+                    time.sleep(AUDIT_EVAL_DELAY)
+                verdict = consensus.Engine(submission).run()
+            except Exception:
+                LOG.exception("audit %s failed during evaluation", audit_id)
+                self.audit_store.abandon(audit_id, digest)
+                self._send_error(500, "audit_failed",
+                                 "audit evaluation failed; retry the submission")
+                return
+            self.audit_store.put(audit_id, digest, verdict)
+            verdict = dict(verdict)
+            verdict["replayed"] = False
+            self._send_json(201, verdict)
+            return
 
     # -- other verbs ------------------------------------------------------------
 

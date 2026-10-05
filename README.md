@@ -93,10 +93,23 @@ Port is configurable via `PORT` (default 8080). All bodies are JSON.
 
 * `201` — new verdict (`"replayed": false`), status `accepted` or `rejected`;
 * `200` — the same `audit_id` was resubmitted with semantically identical
-  content: the original verdict is replayed (`"replayed": true`);
-* `409` — the same `audit_id` with different content: explicit conflict;
+  content: the original verdict is replayed (`"replayed": true`). This also
+  applies to submissions that overlap the first one while it is still being
+  evaluated: semantically identical captures are audited exactly once, and
+  the overlapping call waits for the verdict to become available and then
+  receives that same replay instead of a "processing" error;
+* `409` — the same `audit_id` with different content: explicit conflict
+  (including a different-content submission that arrives while an audit for
+  that id is in flight);
 * `400` — structurally invalid submission (wrong key count,
   `duplicate_identity`, more than 64 events, malformed fields, ...).
+
+If the service (or its persistence file) is interrupted after an audit id is
+reserved but before the verdict is formed, a later retry with identical
+content adopts the pending reservation and completes the audit; the id is
+not refused permanently.  `AUDIT_WAIT_TIMEOUT` (default `30` seconds) bounds
+how long an overlapping call waits for the in-flight verdict before
+re-checking the reservation.
 
 ### Submission
 
@@ -158,11 +171,18 @@ persist them across restarts.
 performs the whole review in one run and exits with the result status:
 
 1. builds the image (`--build`);
-2. runs the lock-rule unit tests (Ed25519 vectors, consensus rules, API);
+2. runs the lock-rule unit tests (Ed25519 vectors, consensus rules, API,
+   and concurrent-submission coordination);
 3. waits for the healthy `audit` container and runs HTTP smoke checks:
    commit trajectories for 4 and 7 validators, reject trajectories (unsafe
    vote, invalid signature, missing certificate), idempotent replay, and
-   conflict handling.
+   conflict handling;
+4. exercises the redundant-controller cutover boundary over real HTTP:
+   nearly simultaneous identical submissions collapse into one new verdict
+   plus replays of the same content, concurrent changes to an event, the
+   validator set, or the genesis block conflict explicitly, and an audit
+   interrupted while pending (service killed, reservation already on disk)
+   is safely completed by an identical retry after restart.
 
 Exit code `0` means everything passed; any failure exits `1`.
 
@@ -182,6 +202,7 @@ app/
   server.py      HTTP API (PORT env, /health, two audit operations)
   healthcheck.py container HEALTHCHECK
   trajgen.py     deterministic signed-trajectory builder (tests/verify)
-tests/           Ed25519 vectors, lock-rule tests, in-process API tests
+tests/           Ed25519 vectors, lock-rule tests, in-process API and
+                 concurrent-submission tests
 verify/run.py    one-shot verify: unit tests + HTTP smoke, exit code
 ```

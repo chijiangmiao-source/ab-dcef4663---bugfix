@@ -13,9 +13,14 @@ then exits with status 0 on success and 1 on any failure.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
+import socket
+import subprocess
 import sys
+import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -48,27 +53,61 @@ def run_unit_tests() -> bool:
 
 def wait_for_service() -> bool:
     print(f"== waiting for audit service at {AUDIT_URL} ==")
-    deadline = time.time() + WAIT_SECONDS
-    while time.time() < deadline:
-        try:
-            with urllib.request.urlopen(AUDIT_URL + "/health", timeout=3) as r:
-                if r.status == 200:
-                    print("  service is healthy")
-                    return True
-        except Exception:
-            pass
-        time.sleep(1)
+    if wait_for_url(AUDIT_URL + "/health", timeout=WAIT_SECONDS):
+        print("  service is healthy")
+        return True
     print("  service did not become healthy in time")
     return False
 
 
-def http(method: str, path: str, body=None):
+def wait_for_url(url: str, timeout: float = 30.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=3) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(0.25)
+    return False
+
+
+def free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def spawn_audit(store_file: str | None = None, eval_delay: float = 0.0,
+                port: int | None = None):
+    """Launch a short-lived audit service inside this container."""
+    port = port or free_port()
+    env = dict(os.environ)
+    env["PORT"] = str(port)
+    env["AUDIT_EVAL_DELAY"] = str(eval_delay)
+    if store_file:
+        env["AUDIT_STORE_FILE"] = store_file
+    else:
+        env.pop("AUDIT_STORE_FILE", None)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "app.server"],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    base = f"http://127.0.0.1:{port}"
+    if not wait_for_url(base + "/health", timeout=15):
+        proc.kill()
+        raise RuntimeError(f"side audit instance on port {port} never started")
+    return proc, base
+
+
+def http(method: str, path: str, body=None, base: str = AUDIT_URL,
+         timeout: float = 10):
     data = None if body is None else json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(AUDIT_URL + path, data=data, method=method)
+    req = urllib.request.Request(base + path, data=data, method=method)
     if data is not None:
         req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read().decode("utf-8"))
@@ -160,6 +199,183 @@ def smoke() -> None:
           f"got {status} {body}")
 
 
+def overlap_smoke() -> None:
+    """Overlapping submissions over real HTTP: one new verdict, equivalent
+    collisions replay the same content; altered content conflicts."""
+    print("== HTTP smoke: overlapping submissions (side instance) ==")
+    proc, base = spawn_audit(eval_delay=1.0)
+    try:
+        builder, blocks = trajgen.build_commit_trajectory(
+            "overlap-identical", 4, 4)
+        submission = builder.submission()
+
+        results: list = []
+
+        def submit(payload):
+            results.append(http("POST", "/v1/audits", payload, base=base,
+                                timeout=20))
+
+        threads = [threading.Thread(target=submit, args=(submission,))
+                   for _ in range(3)]
+        for t in threads:
+            t.start()
+        time.sleep(0.3)  # all three requests are in flight during the delay
+        for t in threads:
+            t.join(timeout=20)
+
+        statuses = sorted(s for s, _ in results)
+        check("overlap: one new verdict and two replays",
+              statuses == [200, 200, 201],
+              f"got {statuses}")
+        created = next(b for s, b in results if s == 201)
+        replayed = [b for s, b in results if s == 200]
+        check("overlap: new verdict accepted, replays flagged",
+              created.get("replayed") is False
+              and all(b.get("replayed") is True for b in replayed),
+              f"got {created.get('replayed')}, "
+              f"{[b.get('replayed') for b in replayed]}")
+        check("overlap: replays carry identical verdict content",
+              all({k: v for k, v in b.items() if k != "replayed"}
+                  == {k: v for k, v in created.items() if k != "replayed"}
+                  for b in replayed),
+              "replay content diverged from the new verdict")
+        check("overlap: 3-chain commits present exactly once",
+              created.get("committed") == blocks[:2])
+
+        # Alterations arriving while another audit is (still) pending must be
+        # explicit conflicts, never "in progress".  Vote signatures cover the
+        # audit id, so each mutation gets its own freshly signed trajectory.
+        mutations = {
+            "business event": lambda s: s["events"].pop(),
+            "validator set": lambda s: s["validators"].__setitem__(
+                0, trajgen.ed25519.publickey(
+                    trajgen.validator_seed(99)).hex()),
+            "genesis block": lambda s: s["genesis"].__setitem__(
+                "id", "11" * 32),
+        }
+        for label, mutate in mutations.items():
+            conf_builder, _ = trajgen.build_commit_trajectory(
+                f"overlap-conflict-{label.replace(' ', '-')}", 4, 4)
+            conf_original = conf_builder.submission()
+            winner = {}
+
+            def post_owner(payload=conf_original):
+                winner["result"] = http("POST", "/v1/audits", payload,
+                                        base=base, timeout=20)
+
+            t = threading.Thread(target=post_owner)
+            t.start()
+            time.sleep(0.3)  # inside the pending window
+            changed = copy.deepcopy(conf_original)
+            mutate(changed)
+            status, body = http("POST", "/v1/audits", changed, base=base,
+                                timeout=20)
+            t.join(timeout=20)
+            owner_status, _ = winner["result"]
+            check(f"overlap conflict via {label}",
+                  status == 409
+                  and body.get("error", {}).get("code") == "conflict"
+                  and owner_status == 201,
+                  f"got {status} {body.get('error')} / owner "
+                  f"{owner_status}")
+
+        # a rejected verdict (unsafe vote) also coalesces under overlap
+        unsafe_builder, _ = trajgen.build_unsafe_vote_trajectory(
+            "overlap-unsafe")
+        unsafe = unsafe_builder.submission()
+        results = []
+        threads = [threading.Thread(
+            target=lambda p: results.append(
+                http("POST", "/v1/audits", p, base=base, timeout=20)),
+            args=(unsafe,)) for _ in range(2)]
+        for t in threads:
+            t.start()
+        time.sleep(0.3)
+        for t in threads:
+            t.join(timeout=20)
+        statuses = sorted(s for s, _ in results)
+        check("overlap: rejected verdict also coalesces",
+              statuses == [200, 201]
+              and all(b.get("status") == "rejected" for _, b in results)
+              and all(b.get("violation", {}).get("type") == "unsafe_vote"
+                      for _, b in results),
+              f"got {statuses}")
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+
+
+def recovery_smoke() -> None:
+    """A persisted pending reservation interrupted before the verdict forms
+    must let an identical retry finish after restart."""
+    print("== HTTP smoke: crash before verdict, safe retry after restart ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        store_file = os.path.join(tmp, "audits.json")
+        builder, blocks = trajgen.build_commit_trajectory(
+            "recovery-pending", 4, 4)
+        submission = builder.submission()
+
+        proc, base = spawn_audit(store_file=store_file, eval_delay=3.0)
+        try:
+            def hold_request():
+                # Expected to fail: this service is killed while evaluating.
+                try:
+                    http("POST", "/v1/audits", submission,
+                         base=base, timeout=15)
+                except Exception:
+                    pass
+
+            holder = threading.Thread(target=hold_request)
+            holder.start()
+            # wait for the pending reservation to reach disk, then kill the
+            # service while its evaluation is still sleeping
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                try:
+                    with open(store_file, encoding="utf-8") as fh:
+                        records = json.load(fh).get("records", {})
+                    if "recovery-pending" in records:
+                        break
+                except (OSError, ValueError):
+                    pass
+                time.sleep(0.1)
+            with open(store_file, encoding="utf-8") as fh:
+                persisted = json.load(fh)["records"]["recovery-pending"]
+            check("pending reservation persisted before verdict",
+                  persisted.get("verdict") is None)
+        finally:
+            proc.kill()
+            proc.wait(timeout=10)
+            holder.join(timeout=5)
+
+        # restart with the same store file and retry identical content
+        proc, base = spawn_audit(store_file=store_file, eval_delay=0.0)
+        try:
+            status, verdict = http("POST", "/v1/audits", submission,
+                                   base=base, timeout=20)
+            check("identical retry after crash completes as new verdict",
+                  status == 201 and verdict.get("status") == "accepted"
+                  and verdict.get("replayed") is False
+                  and verdict.get("committed") == blocks[:2],
+                  f"got {status} {verdict.get('error')}")
+            status, replay = http("POST", "/v1/audits", submission,
+                                  base=base, timeout=20)
+            check("completed verdict replays after recovery",
+                  status == 200 and replay.get("replayed") is True
+                  and replay.get("committed") == blocks[:2],
+                  f"got {status}")
+            changed = copy.deepcopy(submission)
+            changed["events"] = changed["events"][:-1]
+            status, body = http("POST", "/v1/audits", changed, base=base)
+            check("different content still conflicts after recovery",
+                  status == 409
+                  and body.get("error", {}).get("code") == "conflict",
+                  f"got {status}")
+        finally:
+            proc.terminate()
+            proc.wait(timeout=10)
+
+
 def main() -> int:
     ok = run_unit_tests()
     if not ok:
@@ -167,11 +383,14 @@ def main() -> int:
         return 1
     if not wait_for_service():
         return 1
-    try:
-        smoke()
-    except Exception as exc:  # connection reset, JSON decode, ...
-        print(f"  FAIL smoke raised {exc!r}")
-        _FAILURES.append(str(exc))
+    # Each phase runs even if an earlier one failed, so a single report
+    # covers the whole concurrency boundary; the exit code aggregates them.
+    for phase in (smoke, overlap_smoke, recovery_smoke):
+        try:
+            phase()
+        except Exception as exc:  # connection reset, JSON decode, ...
+            print(f"  FAIL {phase.__name__} raised {exc!r}")
+            _FAILURES.append(f"{phase.__name__}: {exc!r}")
     if _FAILURES:
         print(f"VERIFY FAILED: {len(_FAILURES)} check(s) failed: {_FAILURES}")
         return 1
