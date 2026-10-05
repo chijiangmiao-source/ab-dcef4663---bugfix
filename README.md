@@ -93,10 +93,19 @@ Port is configurable via `PORT` (default 8080). All bodies are JSON.
 
 * `201` — new verdict (`"replayed": false`), status `accepted` or `rejected`;
 * `200` — the same `audit_id` was resubmitted with semantically identical
-  content: the original verdict is replayed (`"replayed": true`);
-* `409` — the same `audit_id` with different content: explicit conflict;
+  content: the original verdict is replayed (`"replayed": true`). Overlapping
+  equivalent submissions are coalesced: while the first request evaluates the
+  capture, concurrent identical callers wait and receive the same `200`
+  replay once the single verdict is available — the audit is evaluated
+  exactly once per identifier;
+* `409` — the same `audit_id` with different content: explicit conflict
+  (reported immediately, even while an evaluation is still in flight);
 * `400` — structurally invalid submission (wrong key count,
-  `duplicate_identity`, more than 64 events, malformed fields, ...).
+  `duplicate_identity`, more than 64 events, malformed fields, ...);
+* `503` — an identical submission is still being evaluated after the wait
+  window (retry to obtain the verdict); `500` — the evaluation failed
+  internally; the identifier was released and the same content may be
+  retried safely.
 
 ### Submission
 
@@ -150,7 +159,10 @@ PORT=8080 python -m app.server
 ```
 
 Verdicts are kept in memory; set `AUDIT_STORE_FILE=/path/audits.json` to
-persist them across restarts.
+persist them across restarts. If the service is interrupted while an audit
+is still in flight, its orphaned lease is discarded on the next start, so
+retrying the same content after the restart completes the audit instead of
+being refused forever.
 
 ## Verify
 
@@ -158,11 +170,14 @@ persist them across restarts.
 performs the whole review in one run and exits with the result status:
 
 1. builds the image (`--build`);
-2. runs the lock-rule unit tests (Ed25519 vectors, consensus rules, API);
+2. runs the lock-rule unit tests (Ed25519 vectors, consensus rules, API,
+   and the concurrent-submission boundary: one new verdict plus equivalent
+   replays, explicit conflict for differing concurrent captures, and
+   interruption-safe retry);
 3. waits for the healthy `audit` container and runs HTTP smoke checks:
    commit trajectories for 4 and 7 validators, reject trajectories (unsafe
-   vote, invalid signature, missing certificate), idempotent replay, and
-   conflict handling.
+   vote, invalid signature, missing certificate), idempotent replay,
+   conflict handling, and simultaneous overlapping submissions.
 
 Exit code `0` means everything passed; any failure exits `1`.
 
@@ -178,10 +193,11 @@ app/
   canonical.py   canonical UTF-8 vote/block encodings and digests
   schema.py      structural validation of submissions (HTTP 400)
   consensus.py   lock-rule engine, certificate formation, 3-chain commits
-  store.py       idempotent verdict store (replay / conflict)
+  store.py       idempotent verdict store (concurrent coalescing / replay /
+                 conflict; interruption-safe leases)
   server.py      HTTP API (PORT env, /health, two audit operations)
   healthcheck.py container HEALTHCHECK
   trajgen.py     deterministic signed-trajectory builder (tests/verify)
-tests/           Ed25519 vectors, lock-rule tests, in-process API tests
+tests/           Ed25519 vectors, lock-rule tests, API and concurrency tests
 verify/run.py    one-shot verify: unit tests + HTTP smoke, exit code
 ```

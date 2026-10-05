@@ -3,10 +3,12 @@
 A single run of ``python -m verify.run``:
 
 1. executes the lock-rule unit tests (Ed25519 vectors, consensus rules,
-   in-process API tests);
+   API and concurrent-submission boundary tests);
 2. waits for the ``audit`` service to become healthy and runs HTTP smoke
    checks against it: a commit trajectory, reject trajectories, idempotent
-   replay, and conflict handling;
+   replay, conflict handling, and the concurrency boundary -- simultaneous
+   identical captures coalesce into one new verdict plus replays, while
+   simultaneous differing captures are explicit conflicts;
 
 then exits with status 0 on success and 1 on any failure.
 """
@@ -16,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 import unittest
 import urllib.error
@@ -160,6 +163,135 @@ def smoke() -> None:
           f"got {status} {body}")
 
 
+def _post_raw(path: str, raw: bytes, results: dict, key: int) -> None:
+    req = urllib.request.Request(AUDIT_URL + path, data=raw, method="POST")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            results[key] = (resp.status, json.loads(resp.read().decode("utf-8")))
+    except urllib.error.HTTPError as exc:
+        results[key] = (exc.code, json.loads(exc.read().decode("utf-8")))
+
+
+def _simultaneous(posts: list[tuple[bytes, str]]) -> dict:
+    """Fire every (raw body, path) pair from threads released together."""
+    results: dict = {}
+    barrier = threading.Barrier(len(posts))
+
+    def fire(key, raw, path):
+        barrier.wait()
+        _post_raw(path, raw, results, key)
+
+    threads = [
+        threading.Thread(target=fire, args=(i, raw, path))
+        for i, (raw, path) in enumerate(posts)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    return results
+
+
+def concurrency_smoke() -> None:
+    print("== HTTP smoke: concurrent identical submissions ==")
+    # Several rounds of simultaneous equivalent captures of the same id:
+    # the stable audit id must be evaluated exactly once per round (one 201);
+    # every overlapping equivalent caller receives the same verdict as a
+    # 200 replay rather than an "in progress" refusal.
+    rounds = 5
+    callers = 6
+    for r in range(rounds):
+        builder, blocks = trajgen.build_commit_trajectory(
+            f"smoke-concurrent-{r}", 4, 4)
+        raw = json.dumps(builder.submission()).encode("utf-8")
+        results = _simultaneous([(raw, "/v1/audits")] * callers)
+
+        statuses = sorted(code for code, _ in results.values())
+        check(f"round {r}: one new verdict, {callers - 1} equivalent replays",
+              len(results) == callers and statuses == [200] * (callers - 1) + [201],
+              f"got {statuses}")
+        verdicts = [body for _, body in results.values()]
+        check(f"round {r}: all callers share the same verdict",
+              all(v.get("status") == "accepted"
+                  and v.get("committed") == blocks[:2]
+                  for v in verdicts),
+              f"got {[v.get('violation') for v in verdicts]}")
+        created = [v for v in verdicts if not v.get("replayed")]
+        check(f"round {r}: exactly one non-replayed verdict",
+              len(created) == 1, f"got {len(created)}")
+
+        status, fetched = http("GET", f"/v1/audits/smoke-concurrent-{r}")
+        check(f"round {r}: single verdict readable by id",
+              status == 200 and fetched.get("committed") == blocks[:2],
+              f"got {status}")
+
+    print("== HTTP smoke: concurrent conflicting submissions ==")
+    # Simultaneous sends of semantically different captures under the same
+    # id: exactly one caller may win the single evaluation (201); every
+    # differing caller -- including ones that overlap the in-flight audit --
+    # must be turned away with an explicit 409 conflict.  The three variants
+    # alter one business event, the validator set ordering, and the genesis.
+    audit_id = "smoke-concurrent-conflict"
+    builder, _ = trajgen.build_commit_trajectory(audit_id, 7, 4)
+    submission = builder.submission()
+    variants = []
+    changed_event = json.loads(json.dumps(submission))
+    changed_event["events"] = changed_event["events"][:-1]
+    variants.append(changed_event)
+    changed_validators = json.loads(json.dumps(submission))
+    changed_validators["validators"] = list(
+        reversed(changed_validators["validators"]))
+    variants.append(changed_validators)
+    changed_genesis = json.loads(json.dumps(submission))
+    changed_genesis["genesis"]["id"] = "ab" * 32
+    variants.append(changed_genesis)
+
+    raws = [json.dumps(submission).encode("utf-8")]
+    raws += [json.dumps(v).encode("utf-8") for v in variants]
+    results = _simultaneous([(raw, "/v1/audits") for raw in raws])
+
+    codes = sorted(code for code, _ in results.values())
+    check("one winner and three explicit conflicts under contention",
+          codes == [201, 409, 409, 409], f"got {codes}")
+    conflicts = [body for code, body in results.values() if code == 409]
+    check("every refusal is a content conflict, never 'in progress'",
+          all(b.get("error", {}).get("code") == "conflict" for b in conflicts)
+          and len(conflicts) == 3,
+          f"got {[b.get('error') for b in conflicts]}")
+
+    winner_key = next(k for k, (code, _) in results.items() if code == 201)
+    winner_body = results[winner_key][1]
+    check("the winning verdict is well formed",
+          winner_body.get("audit_id") == audit_id
+          and winner_body.get("replayed") is False,
+          f"got {winner_body}")
+
+    # Whichever variant won: its content now replays; the other three
+    # (including the canonical submission) stay explicit conflicts.
+    status, replay = http("POST", "/v1/audits",
+                          json.loads(raws[winner_key].decode("utf-8")))
+    check("the winning capture replays after the burst",
+          status == 200 and replay.get("replayed") is True
+          and replay.get("committed") == winner_body.get("committed"),
+          f"got {status}")
+    losers_conflict = True
+    for k, raw in enumerate(raws):
+        if k == winner_key:
+            continue
+        status, body = http("POST", "/v1/audits",
+                            json.loads(raw.decode("utf-8")))
+        if status != 409 or body.get("error", {}).get("code") != "conflict":
+            losers_conflict = False
+    check("each differing capture is still an explicit conflict",
+          losers_conflict, "")
+
+    status, fetched = http("GET", f"/v1/audits/{audit_id}")
+    check("the single winning verdict is readable by id",
+          status == 200 and fetched.get("committed")
+          == winner_body.get("committed"), f"got {status}")
+
+
 def main() -> int:
     ok = run_unit_tests()
     if not ok:
@@ -169,6 +301,7 @@ def main() -> int:
         return 1
     try:
         smoke()
+        concurrency_smoke()
     except Exception as exc:  # connection reset, JSON decode, ...
         print(f"  FAIL smoke raised {exc!r}")
         _FAILURES.append(str(exc))

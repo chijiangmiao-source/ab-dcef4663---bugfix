@@ -109,29 +109,63 @@ class Handler(BaseHTTPRequestHandler):
 
         audit_id = submission["audit_id"]
         digest = canonical.submission_digest(submission)
-        outcome = self.audit_store.reserve(audit_id, digest)
-        if outcome == store_mod.CONFLICT:
-            self._send_error(
-                409, "conflict",
-                f"audit_id {audit_id!r} already has a verdict for different "
-                "content")
-            return
-        if outcome == store_mod.PENDING:
-            self._send_error(
-                409, "in_progress",
-                f"audit_id {audit_id!r} is already being evaluated")
-            return
-        if outcome == store_mod.REPLAY:
-            verdict = self.audit_store.get(audit_id)
-            verdict["replayed"] = True
-            self._send_json(200, verdict)
+
+        # Coalesce overlapping submissions of identical content: exactly one
+        # request evaluates the audit; the others wait for its verdict and
+        # replay the same result instead of being refused as "in progress".
+        while True:
+            outcome = self.audit_store.begin(audit_id, digest)
+            if outcome == store_mod.CONFLICT:
+                self._send_error(
+                    409, "conflict",
+                    f"audit_id {audit_id!r} already has a verdict for different "
+                    "content")
+                return
+            if outcome == store_mod.REPLAY:
+                self._send_replay(audit_id)
+                return
+            if outcome == store_mod.PENDING:
+                waited = self.audit_store.wait_for(audit_id, digest)
+                if waited == store_mod.REPLAY:
+                    self._send_replay(audit_id)
+                    return
+                if waited == store_mod.CONFLICT:
+                    self._send_error(
+                        409, "conflict",
+                        f"audit_id {audit_id!r} already has a verdict for "
+                        "different content")
+                    return
+                if waited == store_mod.TIMEOUT:
+                    self._send_error(
+                        503, "audit_still_running",
+                        f"audit_id {audit_id!r} is still being evaluated; "
+                        "retry to obtain the verdict")
+                    return
+                # ABORTED: the in-flight evaluation released its lease; race
+                # any other retry to take over by claiming the id again.
+                continue
+
+            # outcome == NEW: this request owns the single evaluation.
+            try:
+                verdict = consensus.Engine(submission).run()
+            except Exception:  # never wedge the id: release and stay retryable
+                LOG.exception("audit %r evaluation failed", audit_id)
+                self.audit_store.abort(audit_id, digest)
+                self._send_error(
+                    500, "audit_failed",
+                    "the audit could not be completed; the submission may be "
+                    "retried")
+                return
+            self.audit_store.finish(audit_id, digest, verdict)
+            verdict = dict(verdict)
+            verdict["replayed"] = False
+            self._send_json(201, verdict)
             return
 
-        verdict = consensus.Engine(submission).run()
-        self.audit_store.put(audit_id, digest, verdict)
-        verdict = dict(verdict)
-        verdict["replayed"] = False
-        self._send_json(201, verdict)
+    def _send_replay(self, audit_id: str) -> None:
+        verdict = self.audit_store.get(audit_id)
+        verdict["replayed"] = True
+        self._send_json(200, verdict)
 
     # -- other verbs ------------------------------------------------------------
 
@@ -143,11 +177,16 @@ class Handler(BaseHTTPRequestHandler):
     do_PATCH = _method_not_allowed
 
 
+class _Server(ThreadingHTTPServer):
+    # The stdlib default listen backlog is tiny (5); equivalent captures
+    # arrive concurrently and must not be turned away at TCP accept time.
+    request_queue_size = 128
+    daemon_threads = True
+
+
 def make_server(port: int, audit_store: store_mod.AuditStore) -> ThreadingHTTPServer:
     handler_cls = type("BoundHandler", (Handler,), {"audit_store": audit_store})
-    server = ThreadingHTTPServer(("0.0.0.0", port), handler_cls)
-    server.daemon_threads = True
-    return server
+    return _Server(("0.0.0.0", port), handler_cls)
 
 
 def main():
